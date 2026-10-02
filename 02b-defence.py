@@ -1,14 +1,15 @@
 #!/usr/bin/env python3
 """
-02b-defence.py - Service-level defence for scored services.
+02b-defence.py - Service-level defence + listening port scan.
 
 RUN:
     sudo python3 02b-defence.py            -> DRY RUN (nothing changes)
     sudo python3 02b-defence.py --apply    -> APPLY CHANGES
 
 WHAT IT DOES:
-    * Detects which scored services are actually running
-    * Enables fail2ban jails for each (mail, web, DNS, FTP)
+    * Scans listening ports, flags suspicious/unknown ones (WARN ONLY, never touches them)
+    * Detects which scored services are running
+    * Enables fail2ban jails for each running service
     * Hardens each service's config (no open relay, TLS required, no zone transfer, etc.)
     * Backs up every config before editing
     * Validates each config, reverts the service if it fails
@@ -24,9 +25,10 @@ from pathlib import Path
 # ======================================================================================
 #                         CONFIG
 # ======================================================================================
-ENABLE_SERVICE_HARDENING = True   # False = only set up fail2ban jails, skip config edits
+ENABLE_SERVICE_HARDENING = True   # False = only jails + scan, skip config edits
 ENABLE_FAIL2BAN_JAILS    = True
-REFRESH_BASELINE         = True   # Update /root/baseline for 03-monitor
+SCAN_PORTS               = True   # Warn about suspicious/unknown listeners
+REFRESH_BASELINE         = True
 
 # ======================================================================================
 #                         BOOTSTRAP
@@ -44,7 +46,7 @@ if APPLY:
     BK.mkdir(parents=True, exist_ok=True)
 
 RESULTS = []
-DETECTED = {}   # service_label -> True/False
+DETECTED = {}
 
 
 # ======================================================================================
@@ -80,7 +82,7 @@ def run(cmd, timeout=60):
             f.write(f"$ {cmd}\n{r.stdout}{r.stderr}\n")
     return r.returncode, r.stdout.strip(), r.stderr.strip()
 
-def out(cmd, timeout=30):
+def out(cmd, timeout=15):
     try:
         return subprocess.run(cmd, shell=True, capture_output=True, text=True,
                               timeout=timeout).stdout.strip()
@@ -97,50 +99,141 @@ def backup(path):
         except Exception as e:
             warn(f"backup failed for {path}: {e}")
 
-def is_active(service):
-    return out(f"systemctl is-active {service} 2>/dev/null") == "active"
+def which(binary):
+    """Fast, reliable: is this binary in PATH?"""
+    return shutil.which(binary) is not None
 
-def is_installed(service):
-    rc, _, _ = run(f"systemctl status {service} --no-pager 2>/dev/null", timeout=10)
-    return rc in (0, 1, 3)
+def is_active(service):
+    return out(f"systemctl is-active {service} 2>/dev/null", timeout=5) == "active"
 
 
 # ======================================================================================
-#                         STEP 0: DETECT SERVICES
+#                         STEP 0: SCAN LISTENING PORTS (warn only)
+# ======================================================================================
+# Ports the script knows how to handle
+KNOWN_PORTS = {
+    21:    "FTP",
+    22:    "SSH",
+    25:    "Postfix (SMTP)",
+    53:    "BIND (DNS)",
+    80:    "Web (HTTP)",
+    110:   "Dovecot (POP3)",
+    143:   "Dovecot (IMAP)",
+    443:   "Web (HTTPS)",
+    465:   "Postfix (SMTPS)",
+    587:   "Postfix (Submission)",
+    993:   "Dovecot (IMAPS)",
+    995:   "Dovecot (POP3S)",
+}
+
+# Ports that should never be exposed
+SUSPICIOUS_PORTS = {
+    23:    "Telnet (insecure)",
+    111:   "rpcbind (attack surface)",
+    135:   "MS RPC",
+    137:   "NetBIOS",
+    138:   "NetBIOS",
+    139:   "NetBIOS",
+    445:   "SMB (attack surface)",
+    1433:  "MSSQL",
+    2049:  "NFS (attack surface)",
+    3306:  "MySQL/MariaDB",
+    3389:  "RDP",
+    5432:  "PostgreSQL",
+    5900:  "VNC",
+    6379:  "Redis (often unauthenticated)",
+    8080:  "Alt HTTP",
+    8443:  "Alt HTTPS",
+    9200:  "Elasticsearch (often unauthenticated)",
+    11211: "Memcached (amplification risk)",
+    27017: "MongoDB (often unauthenticated)",
+}
+
+def scan_listeners():
+    if not SCAN_PORTS:
+        record("scan", "SKIP", "disabled")
+        return
+
+    log("SCAN LISTENING PORTS (warn only, never touches anything)")
+    output = out("ss -tulpnH", timeout=15)
+    if not output:
+        warn("Could not read listening sockets (ss failed or empty)")
+        record("scan", "WARN", "ss returned nothing")
+        return
+
+    suspicious = []
+    unknown = []
+
+    for line in output.splitlines():
+        parts = line.split()
+        if len(parts) < 5:
+            continue
+        proto = parts[0]
+        local = parts[4]
+        proc = " ".join(parts[6:]) if len(parts) > 6 else "(unknown process)"
+
+        match = re.search(r":(\d+)$", local)
+        if not match:
+            continue
+        port = int(match.group(1))
+
+        if port in SUSPICIOUS_PORTS:
+            warn(f"SUSPICIOUS: {proto} {port} [{SUSPICIOUS_PORTS[port]}] <- {proc}")
+            suspicious.append(port)
+        elif port not in KNOWN_PORTS:
+            warn(f"UNKNOWN: {proto} {port} <- {proc}")
+            unknown.append(port)
+
+    if suspicious:
+        warn(f"Suspicious ports open: {sorted(set(suspicious))}")
+        warn("These should be closed or firewalled immediately.")
+    if unknown:
+        warn(f"Unknown listening ports: {sorted(set(unknown))}")
+        warn("If scored, add to EXTRA_TCP_PORTS in 02-harden.py and rerun.")
+        warn("If not scored, disable the service.")
+
+    status = "PASS" if not (suspicious or unknown) else "WARN"
+    record("scan", status, f"suspicious={len(set(suspicious))} unknown={len(set(unknown))}")
+
+
+# ======================================================================================
+#                         STEP 1: DETECT SERVICES
 # ======================================================================================
 SERVICE_CANDIDATES = {
-    "postfix":   ("Postfix",   [25, 465, 587], []),
-    "dovecot":   ("Dovecot",   [110, 143, 993, 995], []),
-    "named":     ("BIND",      [53], [53]),
-    "bind9":     ("BIND",      [53], [53]),
-    "apache2":   ("Apache",    [80, 443], []),
-    "nginx":     ("Nginx",     [80, 443], []),
-    "lighttpd":  ("Lighttpd",  [80, 443], []),
-    "vsftpd":    ("vsftpd",    [21], []),
-    "proftpd":   ("ProFTPd",   [21], []),
-    "exim4":     ("Exim",      [25, 465, 587], []),
+    "postfix":   ("Postfix",   [25, 465, 587]),
+    "dovecot":   ("Dovecot",   [110, 143, 993, 995]),
+    "named":     ("BIND",      [53]),
+    "bind9":     ("BIND",      [53]),
+    "apache2":   ("Apache",    [80, 443]),
+    "nginx":     ("Nginx",     [80, 443]),
+    "lighttpd":  ("Lighttpd",  [80, 443]),
+    "vsftpd":    ("vsftpd",    [21]),
+    "proftpd":   ("ProFTPd",   [21]),
+    "exim4":     ("Exim",      [25, 465, 587]),
 }
 
 def detect_services():
     global DETECTED
     log("DETECT SERVICES")
     running = []
-    skipped = []
-    for unit, (label, tcp, udp) in SERVICE_CANDIDATES.items():
+    skipped = set()
+    for unit, (label, ports) in SERVICE_CANDIDATES.items():
+        if label in skipped or label in [r.split("(")[0] for r in running]:
+            continue
         if is_active(unit):
             DETECTED[label] = True
             running.append(f"{label}({unit})")
         else:
-            DETECTED[label] = False
-            skipped.append(label)
+            DETECTED.setdefault(label, False)
+            skipped.add(label)
     log(f"Running services: {running or 'none matched'}")
     if skipped:
-        log(f"Not running (skipped): {sorted(set(skipped))}")
+        log(f"Not running (skipped): {sorted(skipped)}")
     record("detect", "PASS", f"{len(running)} found")
 
 
 # ======================================================================================
-#                         STEP 1: FAIL2BAN JAILS
+#                         STEP 2: FAIL2BAN JAILS
 # ======================================================================================
 def fail2ban_jails():
     if not ENABLE_FAIL2BAN_JAILS:
@@ -149,13 +242,12 @@ def fail2ban_jails():
 
     log("FAIL2BAN JAILS")
 
-    if not is_installed("fail2ban"):
+    if not which("fail2ban-client"):
         warn("fail2ban not installed — run 02-harden.py first")
         record("fail2ban_jails", "FAIL", "fail2ban missing")
         return
 
     jails = []
-
     if DETECTED.get("Postfix"):
         jails.append(("postfix", "25,465,587", "/var/log/mail.log", 3, "2h"))
     if DETECTED.get("Dovecot"):
@@ -190,8 +282,7 @@ def fail2ban_jails():
 
     config_path = "/etc/fail2ban/jail.d/scored-services.conf"
     if DRY:
-        print(f"    DRY: write {config_path} with {len(jails)} jails")
-        print(f"    DRY: jails = {[j[0] for j in jails]}")
+        print(f"    DRY: write {config_path} with {len(jails)} jails: {[j[0] for j in jails]}")
     else:
         backup(config_path)
         Path(config_path).parent.mkdir(parents=True, exist_ok=True)
@@ -199,29 +290,28 @@ def fail2ban_jails():
         os.chmod(config_path, 0o644)
         log(f"Wrote {config_path} with jails: {[j[0] for j in jails]}")
 
-    run("systemctl restart fail2ban")
+    run("systemctl restart fail2ban", timeout=30)
     time.sleep(2)
 
-    active_jails = []
-    failed_jails = []
+    active, failed = [], []
     for name, *_ in jails:
-        st = out(f"fail2ban-client status {name} 2>/dev/null")
+        st = out(f"fail2ban-client status {name} 2>/dev/null", timeout=10)
         if "Status for the jail" in st:
-            active_jails.append(name)
+            active.append(name)
         else:
-            failed_jails.append(name)
+            failed.append(name)
 
-    if active_jails:
-        log(f"Active jails: {active_jails}")
-    if failed_jails:
-        warn(f"Failed to start jails: {failed_jails}  (check log format)")
+    if active:
+        log(f"Active jails: {active}")
+    if failed:
+        warn(f"Failed to start jails: {failed}  (check log format)")
 
-    status = "PASS" if not failed_jails else "WARN"
-    record("fail2ban_jails", status, f"active={len(active_jails)} failed={len(failed_jails)}")
+    status = "PASS" if not failed else "WARN"
+    record("fail2ban_jails", status, f"active={len(active)} failed={len(failed)}")
 
 
 # ======================================================================================
-#                         STEP 2: POSTFIX HARDENING
+#                         STEP 3: POSTFIX HARDENING
 # ======================================================================================
 POSTFIX_LINES = [
     "smtpd_banner = $myhostname ESMTP",
@@ -270,7 +360,7 @@ def harden_postfix():
 
 
 # ======================================================================================
-#                         STEP 3: DOVECOT HARDENING
+#                         STEP 4: DOVECOT HARDENING
 # ======================================================================================
 DOVECOT_LINES = [
     "ssl = required",
@@ -318,7 +408,7 @@ def harden_dovecot():
 
 
 # ======================================================================================
-#                         STEP 4: BIND HARDENING
+#                         STEP 5: BIND HARDENING
 # ======================================================================================
 BIND_LINES = [
     'version "not currently available";',
@@ -341,8 +431,7 @@ def harden_bind():
 
     backup(str(cfg))
     content = cfg.read_text()
-    already = all(any(k in content for k in [line]) for line in BIND_LINES)
-    if already:
+    if all(line in content for line in BIND_LINES):
         log("BIND already hardened")
         record("bind", "PASS", "already hardened")
         return
@@ -379,12 +468,9 @@ def harden_bind():
 
 
 # ======================================================================================
-#                         STEP 5: APACHE HARDENING
+#                         STEP 6: APACHE HARDENING
 # ======================================================================================
-APACHE_LINES = [
-    "ServerTokens Prod",
-    "ServerSignature Off",
-]
+APACHE_LINES = ["ServerTokens Prod", "ServerSignature Off"]
 
 def harden_apache():
     if not DETECTED.get("Apache") or not ENABLE_SERVICE_HARDENING:
@@ -393,7 +479,6 @@ def harden_apache():
     cfg_dir = Path("/etc/apache2/conf-available")
     cfg_dir.mkdir(exist_ok=True)
     drop_in = cfg_dir / "99-hardening.conf"
-
     content = "\n".join(APACHE_LINES) + "\n" + \
               "<Directory />\n    Options -Indexes\n    AllowOverride None\n</Directory>\n"
 
@@ -403,10 +488,10 @@ def harden_apache():
         backup(str(drop_in))
         drop_in.write_text(content)
         run("a2enconf 99-hardening", timeout=30)
-        test_out = out("apachectl configtest 2>&1")
+        test_out = out("apachectl configtest 2>&1", timeout=30)
         if "Syntax OK" not in test_out:
             warn("Apache config invalid, disabling drop-in")
-            run("a2disconf 99-hardening")
+            run("a2disconf 99-hardening", timeout=15)
             record("apache", "FAIL", "config invalid, reverted")
             return
         run("systemctl reload apache2", timeout=30)
@@ -419,19 +504,15 @@ def harden_apache():
 
 
 # ======================================================================================
-#                         STEP 6: NGINX HARDENING
+#                         STEP 7: NGINX HARDENING
 # ======================================================================================
-NGINX_LINES = [
-    "server_tokens off;",
-    "autoindex off;",
-]
+NGINX_LINES = ["server_tokens off;", "autoindex off;"]
 
 def harden_nginx():
     if not DETECTED.get("Nginx") or not ENABLE_SERVICE_HARDENING:
         return
     log("NGINX HARDENING")
     drop_in = Path("/etc/nginx/conf.d/99-hardening.conf")
-
     content = "\n".join(NGINX_LINES) + "\n"
 
     if DRY:
@@ -439,7 +520,7 @@ def harden_nginx():
     else:
         backup(str(drop_in))
         drop_in.write_text(content)
-        test_out = out("nginx -t 2>&1")
+        test_out = out("nginx -t 2>&1", timeout=30)
         if "successful" not in test_out:
             warn("Nginx config invalid")
             drop_in.unlink(missing_ok=True)
@@ -455,7 +536,7 @@ def harden_nginx():
 
 
 # ======================================================================================
-#                         STEP 7: REFRESH BASELINE
+#                         STEP 8: REFRESH BASELINE
 # ======================================================================================
 def refresh_baseline():
     if not REFRESH_BASELINE:
@@ -471,14 +552,14 @@ def refresh_baseline():
                      ("/etc/crontab", "crontab")):
         if Path(src).exists():
             shutil.copy(src, b / dst)
-    (b / "ports.txt").write_text(out("ss -tulpn | awk 'NR>1{print $1,$5}' | sort") + "\n")
+    (b / "ports.txt").write_text(out("ss -tulpn | awk 'NR>1{print $1,$5}' | sort", timeout=30) + "\n")
     (b / "suid.txt").write_text(
         out("find / -xdev -perm -4000 -type f 2>/dev/null | sort", timeout=120) + "\n"
     )
     (b / "enabled-units.txt").write_text(
-        out("systemctl list-unit-files --state=enabled --no-pager") + "\n"
+        out("systemctl list-unit-files --state=enabled --no-pager", timeout=30) + "\n"
     )
-    (b / "fail2ban-jails.txt").write_text(out("fail2ban-client status") + "\n")
+    (b / "fail2ban-jails.txt").write_text(out("fail2ban-client status 2>/dev/null") + "\n")
     record("baseline", "PASS", "refreshed")
 
 
@@ -491,6 +572,7 @@ def main():
     print("=" * 70)
 
     steps = [
+        ("scan",        scan_listeners),
         ("detect",      detect_services),
         ("fail2ban",    fail2ban_jails),
         ("postfix",     harden_postfix),
@@ -532,8 +614,7 @@ def main():
         print()
         print("VERIFY:")
         print("  sudo fail2ban-client status")
-        print("  sudo fail2ban-client status postfix    # if postfix running")
-        print("  sudo fail2ban-client status dovecot    # if dovecot running")
+        print("  sudo ss -tlnp")
 
 
 if __name__ == "__main__":
