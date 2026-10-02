@@ -1,67 +1,50 @@
 #!/usr/bin/env python3
 """
-02-harden.py - Competition Linux hardening. Auto-generates SSH keys. Minimal human interaction.
+02-harden.py - Competition Linux hardening. SSH is handled manually (see PLAYBOOK.md).
 
 RUN:
     sudo python3 02-harden.py            -> DRY RUN (nothing changes)
     sudo python3 02-harden.py --apply    -> APPLY CHANGES
 
-OPTIONAL FLAGS:
-    --pubkey "ssh-ed25519 AAAA..."       -> use this pubkey instead of generating one
-    --port 49222                         -> move SSH to this port (default: keep current)
-
-WHAT IT DOES AUTOMATICALLY:
-    * Generates an ed25519 SSH key for the SSH user (if none exists)
-    * Installs the pubkey, disables password auth
-    * Verifies SSH works before finishing
-    * Reverts automatically if verification fails (no lockout)
-    * Locks backdoor UID 0 accounts
-    * Firewalls only a strict allowlist of ports
-    * Configures fail2ban, auditd, PAM faillock, sysctl, etc.
+OPTIONAL FLAG:
+    --port 49222    -> tell the script what port SSH runs on (firewall/fail2ban).
+                       If omitted, auto-detects from the running sshd.
 
 SAFETY:
     * Backups: /root/hardening-backup-<ts>/
     * Log:     /root/hardening-<ts>.log
-    * After a successful run, the private key is at ~<user>/.ssh/id_ed25519
 """
-import os, sys, re, shutil, subprocess, secrets, string, time, grp, pwd
+import os, sys, re, shutil, subprocess, time, grp, pwd
 from pathlib import Path
 
 # ======================================================================================
-#                         CONFIG (usually no edits needed)
+#                         CONFIG
 # ======================================================================================
 ADMIN_IP_OVERRIDE   = None        # None = auto-detect from default route
-SSH_USERS_OVERRIDE  = []          # [] = auto-detect (SUDO_USER or first login user)
-SSH_PORT_OVERRIDE   = None        # None = keep current port
-PUBKEY_OVERRIDE     = ""          # "" = auto-generate
+SSH_PORT_OVERRIDE   = None        # None = auto-detect from running sshd
 EXTRA_TCP_PORTS     = []          # scored ports not in SAFE list (e.g. [8080, 8443])
 EXTRA_UDP_PORTS     = []          # e.g. [123]
 
-ROTATE_PASSWORDS       = False
 DISABLE_JUNK           = True
 ENABLE_UNATTENDED      = True
 WIPE_TMP_ON_BOOT       = True
 INSTALL_AIDE           = False    # slow; off by default
 ENABLE_FAILLOCK        = True
 BLACKLIST_MODULES      = True
-SET_IMMUTABLE_SSH      = True
+SET_IMMUTABLE_SUDOERS  = True
 AIDE_TIMEOUT_SECONDS   = 300
 
 SAFE_TCP_PORTS = {22, 25, 53, 80, 110, 143, 443, 465, 587, 993, 995}
 SAFE_UDP_PORTS = {53, 123}
 
 # ======================================================================================
-#                         CLI ARG PARSING
+#                         CLI ARGS
 # ======================================================================================
 APPLY = "--apply" in sys.argv
 DRY = not APPLY
 
 for i, a in enumerate(sys.argv):
-    if a == "--pubkey" and i + 1 < len(sys.argv):
-        PUBKEY_OVERRIDE = sys.argv[i + 1]
-    elif a.startswith("--pubkey="):
-        PUBKEY_OVERRIDE = a.split("=", 1)[1]
-    elif a == "--port" and i + 1 < len(sys.argv):
+    if a == "--port" and i + 1 < len(sys.argv):
         try: SSH_PORT_OVERRIDE = int(sys.argv[i + 1])
         except ValueError: pass
     elif a.startswith("--port="):
@@ -79,7 +62,7 @@ if APPLY:
 
 RESULTS = []
 IMMUTABLE_FILES = []
-ADMIN_IP, SSH_USERS, SSH_PORT, PUBKEY, TCP_PORTS, UDP_PORTS = "", [], 22, "", [], []
+ADMIN_IP, SSH_PORT, TCP_PORTS, UDP_PORTS = "", 22, [], []
 
 
 # ======================================================================================
@@ -167,124 +150,10 @@ def pkg_install(pkgs):
 
 
 # ======================================================================================
-#                      KEY GENERATION + INSTALLATION
-# ======================================================================================
-def ensure_key_for_user(user):
-    """Ensure user has an ed25519 keypair. Returns pubkey string (or '')."""
-    try:
-        pw = pwd.getpwnam(user)
-    except KeyError:
-        warn(f"User '{user}' does not exist")
-        return ""
-
-    sshdir = Path(pw.pw_dir) / ".ssh"
-    keyfile = sshdir / "id_ed25519"
-    pubfile = Path(str(keyfile) + ".pub")
-
-    if pubfile.exists() and pubfile.stat().st_size > 0:
-        log(f"Reusing existing key for '{user}'")
-        return pubfile.read_text().strip()
-
-    if DRY:
-        print(f"    DRY: would generate ed25519 key for '{user}' at {keyfile}")
-        return "ssh-ed25519 AAAA_DRY_RUN_FAKE_KEY user@dry"
-
-    sshdir.mkdir(mode=0o700, exist_ok=True)
-    os.chmod(sshdir, 0o700)
-    r = subprocess.run(
-        ["ssh-keygen", "-t", "ed25519", "-a", "100", "-N", "",
-         "-f", str(keyfile), "-C", f"{user}@harden"],
-        capture_output=True, text=True,
-    )
-    if r.returncode != 0:
-        warn(f"ssh-keygen failed for '{user}': {r.stderr.strip()}")
-        return ""
-
-    for p in (sshdir, keyfile, pubfile):
-        try: shutil.chown(p, pw.pw_uid, pw.pw_gid)
-        except Exception: pass
-    os.chmod(keyfile, 0o600)
-    os.chmod(pubfile, 0o644)
-
-    log(f"Generated ed25519 key for '{user}': {keyfile}")
-    return pubfile.read_text().strip()
-
-
-def install_pubkey(user, pubkey):
-    """Install pubkey into user's authorized_keys."""
-    if not pubkey: return False
-    try:
-        pw = pwd.getpwnam(user)
-    except KeyError:
-        return False
-
-    sshdir = Path(pw.pw_dir) / ".ssh"
-    ak = sshdir / "authorized_keys"
-
-    if DRY:
-        print(f"    DRY: install pubkey into {ak}")
-        return True
-
-    sshdir.mkdir(mode=0o700, exist_ok=True)
-    existing = ak.read_text().splitlines() if ak.exists() else []
-    if pubkey not in existing:
-        existing.append(pubkey)
-    ak.write_text("\n".join([l for l in existing if l.strip()]) + "\n")
-    os.chmod(sshdir, 0o700)
-    os.chmod(ak, 0o600)
-    try:
-        shutil.chown(sshdir, pw.pw_uid, pw.pw_gid)
-        shutil.chown(ak, pw.pw_uid, pw.pw_gid)
-    except Exception:
-        pass
-    return True
-
-
-# ======================================================================================
-#                     SSH ACCESS VERIFICATION
-# ======================================================================================
-def verify_ssh_access():
-    """Try SSH to 127.0.0.1 using each user's key. Return True if any works."""
-    if DRY:
-        log("DRY: skipping access verification")
-        return True
-
-    for user in SSH_USERS:
-        try:
-            pw = pwd.getpwnam(user)
-        except KeyError:
-            continue
-        keyfile = Path(pw.pw_dir) / ".ssh" / "id_ed25519"
-        if not keyfile.exists():
-            continue
-
-        cmd = (f"ssh -o BatchMode=yes -o ConnectTimeout=5 "
-               f"-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null "
-               f"-p {SSH_PORT} -i {keyfile} {user}@127.0.0.1 'echo OK'")
-        rc, stdout, _ = run(cmd, timeout=15)
-        if rc == 0 and "OK" in stdout:
-            log(f"Access verified: {user} can SSH on port {SSH_PORT}")
-            return True
-
-    warn("Could not verify SSH access")
-    return False
-
-
-def emergency_revert(reason):
-    warn(f"EMERGENCY REVERT: {reason}")
-    conf = "/etc/ssh/sshd_config.d/00-hardening.conf"
-    if Path(conf).exists():
-        strip_immutable(conf)
-        Path(conf).unlink(missing_ok=True)
-    run("systemctl restart ssh || systemctl restart sshd", timeout=30)
-    warn("Removed SSH drop-in. Password auth should work again.")
-
-
-# ======================================================================================
 #                              STEP 0: DETECT ENVIRONMENT
 # ======================================================================================
 def detect_env():
-    global ADMIN_IP, SSH_USERS, SSH_PORT, PUBKEY, TCP_PORTS, UDP_PORTS
+    global ADMIN_IP, SSH_PORT, TCP_PORTS, UDP_PORTS
 
     log("DETECT ENVIRONMENT")
 
@@ -293,17 +162,6 @@ def detect_env():
     ADMIN_IP = ADMIN_IP_OVERRIDE or ip_cidr or ""
     log(f"Subnet: {ADMIN_IP or '(auto-detect failed, SSH open rate-limited)'}")
 
-    if SSH_USERS_OVERRIDE:
-        SSH_USERS = list(SSH_USERS_OVERRIDE)
-    else:
-        sudo_user = os.environ.get("SUDO_USER", "")
-        if sudo_user:
-            SSH_USERS = [sudo_user]
-        else:
-            login = out("awk -F: '$3>=1000 && $7!~/nologin|false/ {print $1}' /etc/passwd").split()
-            SSH_USERS = login[:3]
-    log(f"SSH users: {SSH_USERS}")
-
     if SSH_PORT_OVERRIDE:
         SSH_PORT = SSH_PORT_OVERRIDE
     else:
@@ -311,25 +169,12 @@ def detect_env():
         SSH_PORT = int(detected) if detected.isdigit() else 22
     log(f"SSH port: {SSH_PORT}")
 
-    # Resolve or generate pubkey
-    if PUBKEY_OVERRIDE.strip():
-        PUBKEY = PUBKEY_OVERRIDE.strip()
-        log("PUBKEY: using override")
-    elif SSH_USERS:
-        PUBKEY = ensure_key_for_user(SSH_USERS[0])
-        if PUBKEY:
-            log("PUBKEY: resolved/generated")
-        else:
-            warn("PUBKEY: failed to generate; password auth will stay ON")
-    else:
-        warn("No SSH user found; cannot generate key")
-
     TCP_PORTS = sorted(SAFE_TCP_PORTS | set(EXTRA_TCP_PORTS))
     UDP_PORTS = sorted(SAFE_UDP_PORTS | set(EXTRA_UDP_PORTS))
     log(f"Firewall TCP: {TCP_PORTS}")
     log(f"Firewall UDP: {UDP_PORTS}")
 
-    record("detect", "PASS", f"port={SSH_PORT} users={SSH_USERS}")
+    record("detect", "PASS", f"port={SSH_PORT}")
 
 
 # ======================================================================================
@@ -352,6 +197,14 @@ def accounts():
     issues = []
     strip_immutable("/etc/sudoers")
 
+    # Strip immutable from all sudoers.d drop-ins too (in case a previous run set them)
+    sd_dir = Path("/etc/sudoers.d")
+    if sd_dir.exists():
+        for f in sd_dir.iterdir():
+            if f.is_file():
+                strip_immutable(str(f))
+
+    # Lock any extra UID 0 accounts
     for line in Path("/etc/passwd").read_text().splitlines():
         f = line.split(":")
         if len(f) > 6 and f[2] == "0" and f[0] != "root":
@@ -360,6 +213,7 @@ def accounts():
             run(f"usermod -s /usr/sbin/nologin {f[0]}")
             issues.append(f"UID0:{f[0]}")
 
+    # Lock empty-password accounts
     for line in Path("/etc/shadow").read_text().splitlines():
         f = line.split(":")
         if len(f) > 1 and f[1] == "" and not f[0].startswith("!"):
@@ -367,20 +221,27 @@ def accounts():
             run(f"passwd -l {f[0]}")
             issues.append(f"emptypw:{f[0]}")
 
+    # Lock root ONLY if there is a verified alternate sudo user (prevents self-lockout)
+    sudo_user = os.environ.get("SUDO_USER", "")
     try:
-        sudoers = grp.getgrnam("sudo").gr_mem
+        sudo_members = grp.getgrnam("sudo").gr_mem
     except KeyError:
-        sudoers = []
-    if sudoers:
-        run("passwd -l root")
-        log("Locked root password")
+        sudo_members = []
 
+    if sudo_user and sudo_user != "root" and sudo_user in sudo_members:
+        log(f"Locking root password (alternate access via '{sudo_user}')")
+        run("passwd -l root")
+    else:
+        warn(f"NOT locking root password (no verified alternate sudo user; SUDO_USER='{sudo_user}')")
+
+    # Comment out NOPASSWD entries
     nopasswd = out("grep -rE 'NOPASSWD' /etc/sudoers /etc/sudoers.d 2>/dev/null").splitlines()
     for l in nopasswd:
         warn(f"NOPASSWD: {l.strip()}")
     if nopasswd:
         run("sed -i '/NOPASSWD/ s/^/#/' /etc/sudoers /etc/sudoers.d/* 2>/dev/null || true")
 
+    # Sudo hardening drop-in
     sd = "/etc/sudoers.d/99-hardening"
     write(sd, "Defaults timestamp_timeout=5\n"
               "Defaults passwd_tries=3\n"
@@ -394,6 +255,7 @@ def accounts():
         warn("sudoers drop-in invalid -> removed")
         if APPLY: Path(sd).unlink(missing_ok=True)
 
+    # Restrict 'su' to sudo group
     pam_su = Path("/etc/pam.d/su")
     if pam_su.exists():
         lines = pam_su.read_text().splitlines()
@@ -404,6 +266,7 @@ def accounts():
             lines.insert(idx + 1, wheel)
             write("/etc/pam.d/su", "\n".join(lines) + "\n")
 
+    # login.defs hardening
     txt = Path("/etc/login.defs").read_text()
     txt = re.sub(r"(?m)^PASS_MAX_DAYS.*", "PASS_MAX_DAYS   90", txt)
     txt = re.sub(r"(?m)^PASS_MIN_DAYS.*", "PASS_MIN_DAYS   1", txt)
@@ -411,6 +274,7 @@ def accounts():
     txt = re.sub(r"(?m)^UMASK.*", "UMASK           027", txt)
     write("/etc/login.defs", txt)
 
+    # Force nologin on system accounts with login shells
     for u in pwd.getpwall():
         if 0 < u.pw_uid < 1000 and not re.search(r"nologin|false$", u.pw_shell):
             run(f"usermod -s /usr/sbin/nologin {u.pw_name}")
@@ -419,92 +283,7 @@ def accounts():
 
 
 # ======================================================================================
-#                              STEP 3: SSH
-# ======================================================================================
-def ssh():
-    log("SSH")
-    for f in ("/etc/ssh/sshd_config", "/etc/ssh/sshd_config.d/00-hardening.conf"):
-        strip_immutable(f)
-
-    # Install pubkey for every allowed user
-    users_with_keys = []
-    for user in SSH_USERS:
-        user_pub = PUBKEY if PUBKEY.strip() else ensure_key_for_user(user)
-        if user_pub and install_pubkey(user, user_pub):
-            users_with_keys.append(user)
-        else:
-            warn(f"No usable key for '{user}'")
-
-    # Password auth: 'no' only if EVERY user has a key
-    pwauth = "no"
-    for user in SSH_USERS:
-        if user not in users_with_keys:
-            pwauth = "yes"
-            warn(f"'{user}' has no key -> PasswordAuthentication stays ON")
-            break
-
-    if not users_with_keys:
-        pwauth = "yes"
-        warn("No keys installed -> PasswordAuthentication stays ON")
-
-    conf = f"""Port {SSH_PORT}
-KexAlgorithms curve25519-sha256,curve25519-sha256@libssh.org,diffie-hellman-group16-sha512,diffie-hellman-group18-sha512
-Ciphers chacha20-poly1305@openssh.com,aes256-gcm@openssh.com,aes128-gcm@openssh.com
-MACs hmac-sha2-512-etm@openssh.com,hmac-sha2-256-etm@openssh.com
-HostKeyAlgorithms ssh-ed25519,rsa-sha2-512,rsa-sha2-256
-Banner /etc/issue.net
-PermitUserEnvironment no
-PermitRootLogin no
-PasswordAuthentication {pwauth}
-PubkeyAuthentication yes
-PermitEmptyPasswords no
-KbdInteractiveAuthentication no
-MaxAuthTries 3
-MaxSessions 4
-MaxStartups 10:30:60
-LoginGraceTime 30
-X11Forwarding no
-AllowTcpForwarding no
-AllowAgentForwarding no
-AllowStreamLocalForwarding no
-ClientAliveInterval 300
-ClientAliveCountMax 2
-LogLevel VERBOSE
-UseDNS no
-"""
-    if SSH_USERS:
-        conf += f"AllowUsers {' '.join(SSH_USERS)}\n"
-
-    conf_path = "/etc/ssh/sshd_config.d/00-hardening.conf"
-    write("/etc/issue.net", "Authorized use only. Activity is monitored and logged.\n")
-    write(conf_path, conf)
-
-    if APPLY:
-        rc, _, err = run("sshd -t")
-        if rc != 0:
-            warn(f"sshd -t failed: {err}")
-            Path(conf_path).unlink(missing_ok=True)
-            record("ssh", "FAIL", "invalid sshd config")
-            return
-        if "ssh.socket" in out("systemctl list-unit-files"):
-            run("systemctl disable --now ssh.socket")
-            run("systemctl enable ssh.service")
-        run("systemctl restart ssh || systemctl restart sshd")
-        eff = out("sshd -T | grep -E '^(port|permitrootlogin|passwordauthentication|maxauthtries) '")
-        log(f"Effective: {eff.replace(chr(10), ' | ')}")
-
-        if not verify_ssh_access():
-            emergency_revert("SSH access verification failed")
-            record("ssh", "FAIL", "reverted")
-            return
-    else:
-        run("sshd -t")
-
-    record("ssh", "PASS", f"port={SSH_PORT} pwauth={pwauth}")
-
-
-# ======================================================================================
-#                              STEP 4: FIREWALL
+#                              STEP 3: FIREWALL
 # ======================================================================================
 def firewall():
     log("FIREWALL (ufw)")
@@ -530,7 +309,7 @@ def firewall():
 
 
 # ======================================================================================
-#                              STEP 5: SYSCTL
+#                              STEP 4: SYSCTL / KERNEL
 # ======================================================================================
 def sysctl():
     log("KERNEL (sysctl)")
@@ -585,7 +364,7 @@ install usb-storage /bin/true
 
 
 # ======================================================================================
-#                              STEP 6: PERMISSIONS
+#                              STEP 5: FILE PERMISSIONS
 # ======================================================================================
 def permissions():
     log("FILE PERMISSIONS")
@@ -607,7 +386,7 @@ def permissions():
 
 
 # ======================================================================================
-#                              STEP 7: SERVICES
+#                              STEP 6: SERVICE MINIMISATION
 # ======================================================================================
 JUNK_SERVICES = ["avahi-daemon", "avahi-autoipd", "cups", "cups-browsed", "bluetooth",
                  "ModemManager", "packagekit", "usbmuxd", "speech-dispatcher",
@@ -629,7 +408,7 @@ def junk_services():
 
 
 # ======================================================================================
-#                              STEP 8: DEFENCE TOOLS
+#                              STEP 7: FAIL2BAN + AUDITD
 # ======================================================================================
 def defence_tools():
     log("FAIL2BAN + AUDITD")
@@ -693,7 +472,7 @@ port = {SSH_PORT}
 
 
 # ======================================================================================
-#                              STEP 9: PAM
+#                              STEP 8: PAM
 # ======================================================================================
 def pam_misc():
     log("PAM")
@@ -731,7 +510,7 @@ Account:
 
 
 # ======================================================================================
-#                              STEP 10: EXTRAS
+#                              STEP 9: EXTRAS
 # ======================================================================================
 def extras():
     if ENABLE_UNATTENDED:
@@ -750,7 +529,7 @@ APT::Periodic::AutocleanInterval "7";
 
 
 # ======================================================================================
-#                              STEP 11: BASELINE
+#                              STEP 10: BASELINE
 # ======================================================================================
 def baseline():
     log("BASELINE")
@@ -762,7 +541,7 @@ def baseline():
     for src, dst in (("/etc/passwd", "passwd"), ("/etc/group", "group"), ("/etc/crontab", "crontab")):
         if Path(src).exists():
             shutil.copy(src, b / dst)
-    (b / "suid.txt").write_text(out("find / -xdev -perm -4000 -type f 2>/dev/null | sort") + "\n")
+    (b / "suid.txt").write_text(out("find / -xdev -perm -4000 -type f 2>/dev/null | sort", timeout=120) + "\n")
     (b / "ports.txt").write_text(out("ss -tulpn | awk 'NR>1{print $1,$5}' | sort") + "\n")
     (b / "enabled-units.txt").write_text(out("systemctl list-unit-files --state=enabled --no-pager") + "\n")
     (b / "uid0.txt").write_text(out("awk -F: '$3==0 {print $1}' /etc/passwd") + "\n")
@@ -770,21 +549,18 @@ def baseline():
 
 
 # ======================================================================================
-#                              STEP 12: FINALISE
+#                              STEP 11: FINALISE
 # ======================================================================================
 def finalise():
-    if not SET_IMMUTABLE_SSH:
+    if not SET_IMMUTABLE_SUDOERS:
         record("finalise", "SKIP", "disabled")
         return
     if DRY:
-        print("    DRY: chattr +i on sshd_config, sudoers")
+        print("    DRY: chattr +i on /etc/sudoers")
         record("finalise", "PASS", "dry")
         return
-    log("FINALISE: immutable bits")
-    for f in ("/etc/ssh/sshd_config",
-              "/etc/ssh/sshd_config.d/00-hardening.conf",
-              "/etc/sudoers"):
-        apply_immutable(f)
+    log("FINALISE: immutable bits on /etc/sudoers")
+    apply_immutable("/etc/sudoers")
     record("finalise", "PASS", f"{len(IMMUTABLE_FILES)} files immutable")
 
 
@@ -800,7 +576,6 @@ def main():
         ("detect",      detect_env),
         ("recon",       recon),
         ("accounts",    accounts),
-        ("ssh",         ssh),
         ("firewall",    firewall),
         ("sysctl",      sysctl),
         ("permissions", permissions),
@@ -827,7 +602,6 @@ def main():
         fail("Interrupted")
         record("INTERRUPTED", "FAIL", "Ctrl+C")
 
-    # Summary
     print("\n" + "=" * 70)
     print("SUMMARY")
     print("=" * 70)
@@ -841,21 +615,11 @@ def main():
     else:
         print(f"Log:     {LOG}")
         print(f"Backups: {BK}")
-        # Show key location
-        for user in SSH_USERS:
-            try:
-                pw = pwd.getpwnam(user)
-                keyfile = Path(pw.pw_dir) / ".ssh" / "id_ed25519"
-                if keyfile.exists():
-                    print(f"\nPRIVATE KEY for '{user}': {keyfile}")
-                    print(f"  Copy this key somewhere safe (AI chat / notes file).")
-                    print(f"  Run:  sudo cat {keyfile}")
-            except KeyError:
-                pass
-        print("\nMANUAL TODO:")
-        print("  1. Copy the private key above (if generated).")
-        print("  2. Test SSH from another terminal before closing this session.")
-        print("  3. GRUB password (interactive, not scriptable).")
+        print()
+        print("MANUAL TODO:")
+        print("  1. Harden SSH manually (see PLAYBOOK.md Section 1).")
+        print("  2. GRUB password (interactive, not scriptable).")
+        print("  3. Test every scored service from ANOTHER host.")
 
 
 if __name__ == "__main__":
